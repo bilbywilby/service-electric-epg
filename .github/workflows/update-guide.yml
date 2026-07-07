@@ -1,0 +1,71 @@
+name: Update XMLTV Guide
+
+on:
+  schedule:
+    # 09:30 UTC daily = 05:30 America/New_York during EDT, 04:30 during EST.
+    # GitHub Actions cron is fixed UTC and does not shift for DST; if you
+    # want a fixed *local* time you'll need to update this line twice a
+    # year, or accept the one-hour drift across the March/November change.
+    - cron: "30 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-guide
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run offline smoke tests
+        run: python -m pytest tests/ -v
+
+  update:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch schedule and build XMLTV
+        working-directory: scripts
+        env:
+          SD_USERNAME: ${{ secrets.SD_USERNAME }}
+          SD_PASSWORD: ${{ secrets.SD_PASSWORD }}
+          SD_LINEUP_ID: ${{ vars.SD_LINEUP_ID }}
+          DAYS_AHEAD: ${{ vars.DAYS_AHEAD || '10' }}
+          OUTPUT_PATH: ../data/guide.xml
+        run: python fetch_epg.py
+
+      - name: Validate the file is well-formed XML
+        run: python -c "import xml.dom.minidom as m; m.parse('data/guide.xml'); print('guide.xml is well-formed')"
+
+      - name: Commit and push if the guide changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/guide.xml
+          if git diff --cached --quiet; then
+            echo "No schedule changes since last run; nothing to commit."
+          else
+            git commit -m "Update XMLTV guide $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi

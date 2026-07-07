@@ -1,0 +1,3 @@
+This directory holds the generated data/guide.xml XMLTV file, committed
+daily by .github/workflows/update-guide.yml. It doesn't exist until the
+workflow runs successfully at least once.
