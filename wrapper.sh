@@ -8,13 +8,22 @@ LOGFILE="$HOME/logs/epg_fetch.log"
 mkdir -p "$HOME/logs"
 
 # Use flock to ensure only one instance runs.
-# File descriptor 200 is used for the lock.
-# -n flag causes flock to exit immediately if the lock is held.
 (
   flock -n 200 || { echo "$(date): Job already running, skipping." >> "$LOGFILE"; exit 0; }
 
   cd "$HOME/downloads/service-electric-epg" || exit 1
   
+  # Load environment variables from config/.env
+  if [ -f config/.env ]; then
+      # 'set -a' automatically exports all variables defined in the sourced file
+      set -a
+      source config/.env
+      set +a
+  else
+      echo "$(date): ERROR: config/.env not found. Cannot start." >> "$LOGFILE"
+      exit 1
+  fi
+
   # Activate virtual environment
   source venv/bin/activate
   
