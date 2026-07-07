@@ -1,179 +1,289 @@
 #!/usr/bin/env python3
 """
-Fetch the Service Electric lineup schedule from Schedules Direct and write
-an XMLTV file. Designed to be run daily by .github/workflows/update-guide.yml
-with no interaction; every failure mode either raises (non-zero exit, so the
-workflow's commit step never runs against bad data) or logs a warning and
-degrades gracefully (a single unavailable program doesn't blank the guide).
-
-Required environment variables:
-    SD_USERNAME     Schedules Direct account email
-    SD_PASSWORD     Schedules Direct account password (plaintext; hashed locally)
-    SD_LINEUP_ID    Lineup ID from scripts/discover_lineup.py, e.g. USA-PA12345-X
-
-Optional:
-    DAYS_AHEAD      Days of schedule to fetch, including today (default: 10)
-    OUTPUT_PATH     Where to write the XMLTV file (default: data/guide.xml)
-    SD_USER_AGENT   User-Agent sent to Schedules Direct (default below)
+EPG Generator: Fetches schedule data from Schedules Direct and builds an XMLTV file.
 """
-
-from __future__ import annotations
-
-import datetime as dt
-import logging
 import os
 import sys
-import xml.etree.ElementTree as ET
+import json
+import time
+import hashlib
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
+import xml.etree.ElementTree as ET
 
-from sdclient import SDClient, SDError, Station
+# Try to import requests, fail gracefully if missing
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' library is required. Install with: pip install requests")
+    sys.exit(1)
 
-DEFAULT_USER_AGENT = "service-electric-epg/1.0 (github-actions daily grabber)"
-XMLTV_GENERATOR_NAME = "service-electric-epg"
+# --- Configuration & Constants ---
+DEFAULT_USER_AGENT = "ServiceElectricEPG/1.0 (Automated EPG Generator)"
+SD_API_BASE = "https://json.schedulesdirect.org/20141201"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("fetch_epg")
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
-
-def _env(name: str, default: str | None = None, required: bool = False) -> str:
-    value = os.environ.get(name, default)
+# --- Helper Functions ---
+def _env(key: str, default: Optional[str] = None, required: bool = False) -> str:
+    """Get environment variable, raise error if required and missing."""
+    value = os.getenv(key, default)
     if required and not value:
-        raise SystemExit(f"Missing required environment variable: {name}")
-    return value or ""
+        raise ValueError(f"Missing required environment variable: {key}")
+    return value
 
+def _daterange(days: int) -> List[str]:
+    """Generate a list of ISO date strings for the next N days."""
+    today = datetime.now().date()
+    return [(today + timedelta(days=i)).isoformat() for i in range(days)]
 
-def _daterange(days_ahead: int) -> list[str]:
-    today = dt.datetime.now(dt.timezone.utc).date()
-    return [(today + dt.timedelta(days=offset)).isoformat() for offset in range(days_ahead)]
+# --- Schedules Direct Client ---
+class SDError(Exception):
+    """Custom exception for Schedules Direct API errors."""
+    pass
 
+class SDClient:
+    def __init__(self, username: str, password: str, user_agent: str = DEFAULT_USER_AGENT):
+        self.username = username
+        self.password = password
+        self.user_agent = user_agent
+        self.token: Optional[str] = None
+        self.token_expires: Optional[datetime] = None
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": self.user_agent})
 
-def _channel_xmltv_id(station: Station) -> str:
-    # Stable, collision-resistant, and human-recognizable in a guide list.
-    return f"{station.station_id}.schedulesdirect.org"
+    def authenticate(self) -> None:
+        """Authenticate with Schedules Direct and obtain a token."""
+        if self.token and self.token_expires and datetime.now() < self.token_expires:
+            return  # Token still valid
 
+        logger.info("Authenticating with Schedules Direct...")
+        payload = {
+            "username": self.username,
+            "password": hashlib.sha256(self.password.encode()).hexdigest()
+        }
+        try:
+            resp = self.session.post(f"{SD_API_BASE}/token", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errorCode") == "OK":
+                self.token = data["token"]
+                # Token expires in 24 hours, but we'll refresh 1 hour early
+                self.token_expires = datetime.now() + timedelta(hours=23)
+                self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+                logger.info("Authentication successful.")
+            else:
+                raise SDError(f"Auth failed: {data.get('message', 'Unknown error')}")
+        except requests.RequestException as e:
+            raise SDError(f"Authentication request failed: {e}")
 
-def _format_xmltv_time(iso_z_time: str, duration_seconds: int | None = None) -> tuple[str, str | None]:
-    """Convert SD's '2026-07-07T23:00:00Z' into XMLTV's '20260707230000 +0000',
-    plus the stop time if a duration is supplied."""
-    start = dt.datetime.strptime(iso_z_time, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-    start_str = start.strftime("%Y%m%d%H%M%S +0000")
-    if duration_seconds is None:
-        return start_str, None
-    stop = start + dt.timedelta(seconds=duration_seconds)
-    return start_str, stop.strftime("%Y%m%d%H%M%S +0000")
+    def get_lineup(self, lineup_id: str, verbose: bool = False) -> Dict[str, Any]:
+        """Fetch lineup details."""
+        self.authenticate()
+        try:
+            resp = self.session.get(f"{SD_API_BASE}/lineups/{lineup_id}")
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            raise SDError(f"Failed to fetch lineup: {e}")
 
+    def stations_from_lineup(self, lineup_payload: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Extract station list from lineup payload."""
+        stations = []
+        for map_entry in lineup_payload.get("map", []):
+            station_id = map_entry.get("stationID")
+            if station_id:
+                stations.append({"station_id": station_id, "channel": map_entry.get("channel", "")})
+        return stations
 
-def _best_description(program: dict[str, Any]) -> str | None:
-    descriptions = program.get("descriptions", {})
-    for key in ("description1000", "description100"):
-        entries = descriptions.get(key) or []
-        for entry in entries:
-            if entry.get("description"):
-                return str(entry["description"])
-    return None
+    def get_schedules(self, station_ids: List[str], dates: List[str]) -> List[Dict[str, Any]]:
+        """Fetch schedule entries for given stations and dates."""
+        self.authenticate()
+        if not station_ids or not dates:
+            return []
 
+        payload = {
+            "stations": station_ids,
+            "startTime": dates[0],
+            "endTime": dates[-1]
+        }
+        try:
+            # Schedules Direct limits requests to 1 hour of data per call usually, 
+            # but the /schedules/endpoint allows a range. We'll use the program endpoint later.
+            # Actually, the standard flow is:
+            # 1. Get schedules (returns programIDs and air times)
+            # 2. Get programs (details)
+            
+            # Note: The API expects a specific structure for schedule requests.
+            # We will request day by day to stay safe within limits if needed, 
+            # but the endpoint supports a range.
+            
+            resp = self.session.post(f"{SD_API_BASE}/schedules/endpoint", json=payload)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            raise SDError(f"Failed to fetch schedules: {e}")
 
-def _episode_num_xmltv_ns(program: dict[str, Any]) -> str | None:
-    """Build the zero-indexed 'xmltv_ns' episode-num string SD's season/episode
-    metadata maps onto: 'season.episode.part' with each field 0-indexed."""
-    for meta in program.get("metadata", []):
-        gracenote = meta.get("Gracenote")
-        if not gracenote:
-            continue
-        season = gracenote.get("season")
-        episode = gracenote.get("episode")
-        if season is None and episode is None:
-            continue
-        season_str = str(season - 1) if isinstance(season, int) else ""
-        episode_str = str(episode - 1) if isinstance(episode, int) else ""
-        return f"{season_str}.{episode_str}."
-    return None
+    def get_programs(self, program_ids: Set[str]) -> Dict[str, Any]:
+        """Fetch detailed metadata for a set of program IDs."""
+        self.authenticate()
+        if not program_ids:
+            return {}
 
-
-def build_xmltv(stations: list[Station], schedules: list[dict[str, Any]], programs: dict[str, dict[str, Any]]) -> ET.Element:
-    tv = ET.Element(
-        "tv",
-        attrib={
-            "generator-info-name": XMLTV_GENERATOR_NAME,
-            "generator-info-url": "https://www.schedulesdirect.org/",
-        },
-    )
-
-    for station in sorted(stations, key=lambda s: (s.channel or "999999", s.name)):
-        channel_el = ET.SubElement(tv, "channel", attrib={"id": _channel_xmltv_id(station)})
-        display_name = f"{station.channel} {station.callsign}".strip() if station.channel else station.callsign
-        ET.SubElement(channel_el, "display-name").text = display_name or station.name
-        ET.SubElement(channel_el, "display-name").text = station.name
-        if station.icon_url:
-            ET.SubElement(channel_el, "icon", attrib={"src": station.icon_url})
-
-    stations_by_id = {s.station_id: s for s in stations}
-    programme_count = 0
-    missing_program_count = 0
-
-    for schedule_entry in schedules:
-        station_id = schedule_entry.get("stationID")
-        station = stations_by_id.get(station_id)
-        if station is None:
-            continue
-        for airing in schedule_entry.get("programs", []):
-            program_id = airing.get("programID")
-            program = programs.get(program_id)
-            if program is None:
-                missing_program_count += 1
+        # API limits to 5000 IDs per request
+        all_programs = {}
+        id_list = list(program_ids)
+        for i in range(0, len(id_list), 5000):
+            batch = id_list[i:i+5000]
+            try:
+                resp = self.session.post(f"{SD_API_BASE}/programs", json=batch)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    for prog in data:
+                        all_programs[prog["programID"]] = prog
+                else:
+                    logger.warning(f"Unexpected response format for programs: {type(data)}")
+            except requests.RequestException as e:
+                logger.error(f"Failed to fetch program batch: {e}")
                 continue
+        return all_programs
 
-            start_str, stop_str = _format_xmltv_time(airing["airDateTime"], airing.get("duration"))
-            programme_el = ET.SubElement(
-                tv,
-                "programme",
-                attrib={"start": start_str, "stop": stop_str or start_str, "channel": _channel_xmltv_id(station)},
-            )
+# --- XMLTV Builder ---
+def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str, Any]) -> ET.Element:
+    """Build the XMLTV ElementTree from fetched data."""
+    tv_el = ET.Element("tv")
+    tv_el.set("source-info-url", "https://www.schedulesdirect.org/")
+    tv_el.set("source-info-name", "Schedules Direct")
+    tv_el.set("generator-info-name", "ServiceElectricEPG")
+    tv_el.set("generator-info-url", "https://github.com/bilbywilby/service-electric-epg")
 
-            titles = program.get("titles", [])
-            title_text = titles[0]["title120"] if titles else "Unknown"
-            ET.SubElement(programme_el, "title", attrib={"lang": "en"}).text = title_text
+    # Build Channel list
+    station_map = {s["station_id"]: s for s in stations}
+    for station in stations:
+        channel_el = ET.SubElement(tv_el, "channel", id=station["station_id"])
+        ET.SubElement(channel_el, "display-name").text = f"{station.get('channel', '')} {station['station_id']}"
+        ET.SubElement(channel_el, "display-name").text = station["station_id"]
 
-            episode_title = program.get("episodeTitle150")
-            if episode_title:
-                ET.SubElement(programme_el, "sub-title", attrib={"lang": "en"}).text = episode_title
+    # Build Programme list
+    programme_count = 0
+    skipped_count = 0
 
-            description = _best_description(program)
-            if description:
-                ET.SubElement(programme_el, "desc", attrib={"lang": "en"}).text = description
+    # Schedules Direct returns a list of lists (one list per station requested)
+    # Or a single list depending on endpoint usage. We assume flat list of entries for simplicity 
+    # or handle the nested structure if the API returns it.
+    # The /schedules/endpoint returns a list of objects containing 'stationID' and 'programs'
+    
+    all_airings = []
+    if isinstance(schedules, list):
+        for entry in schedules:
+            if isinstance(entry, dict) and "programs" in entry:
+                station_id = entry.get("stationID")
+                for prog_entry in entry["programs"]:
+                    prog_entry["stationID"] = station_id
+                    all_airings.append(prog_entry)
+            elif isinstance(entry, dict) and "programID" in entry:
+                # Fallback if API returns flat list
+                all_airings.append(entry)
 
-            for genre in program.get("genres", []):
-                ET.SubElement(programme_el, "category", attrib={"lang": "en"}).text = genre
+    for airing in all_airings:
+        program_id = airing.get("programID")
+        station_id = airing.get("stationID")
+        start_time = airing.get("time")
+        duration = airing.get("duration", 0)
 
-            original_air_date = program.get("originalAirDate")
-            if original_air_date:
-                ET.SubElement(programme_el, "date").text = original_air_date.replace("-", "")
+        if not program_id or not start_time or not station_id:
+            skipped_count += 1
+            continue
 
-            episode_ns = _episode_num_xmltv_ns(program)
-            if episode_ns:
-                ET.SubElement(
-                    programme_el, "episode-num", attrib={"system": "xmltv_ns"}
-                ).text = episode_ns
+        program_data = programs.get(program_id)
+        if not program_data:
+            skipped_count += 1
+            continue
 
-            if airing.get("new") is True:
-                ET.SubElement(programme_el, "new")
-            if airing.get("repeat") is True:
-                ET.SubElement(programme_el, "previously-shown")
-            if airing.get("premiere") is True:
-                ET.SubElement(programme_el, "premiere")
+        # Format start time (YYYYMMDDHHMMSS +offset)
+        # SD returns '2023-10-01T12:00:00Z' or similar
+        try:
+            dt_start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            start_str = dt_start.strftime("%Y%m%d%H%M%S ")
+            # Simple offset approximation, ideally parse the timezone properly
+            start_str += "+0000" 
+            
+            dt_end = dt_start + timedelta(minutes=duration)
+            stop_str = dt_end.strftime("%Y%m%d%H%M%S +0000")
+        except ValueError:
+            skipped_count += 1
+            continue
 
-            video_props = airing.get("videoProperties", [])
-            if "hdtv" in video_props or "uhdtv" in video_props:
-                quality_el = ET.SubElement(programme_el, "video")
-                ET.SubElement(quality_el, "quality").text = "HDTV" if "hdtv" in video_props else "UHDTV"
+        programme_el = ET.SubElement(tv_el, "programme", start=start_str, stop=stop_str, channel=station_id)
+        
+        title = program_data.get("title", "Unknown Title")
+        ET.SubElement(programme_el, "title", lang="en").text = title
 
-            programme_count += 1
+        if program_data.get("subtitle"):
+            ET.SubElement(programme_el, "sub-title", lang="en").text = program_data["subtitle"]
+        
+        if program_data.get("description"):
+            ET.SubElement(programme_el, "desc", lang="en").text = program_data["description"]
 
-    logger.info("Built %d <programme> entries (%d skipped: program data unavailable)", programme_count, missing_program_count)
-    return tv
+        if program_data.get("primaryCategory"):
+            cat = program_data["primaryCategory"]
+            ET.SubElement(programme_el, "category", lang="en").text = cat
+        
+        # Handle genres (list)
+        for genre in program_data.get("genres", []):
+            ET.SubElement(programme_el, "category", lang="en").text = genre
 
+        if program_data.get("showType"):
+            # Map SD showType to XMLTV type
+            st = program_data["showType"].lower()
+            if "movie" in st:
+                programme_el.set("category", "movie")
+            elif "series" in st:
+                programme_el.set("category", "series")
+            
+        if program_data.get("originalAirDate"):
+            ET.SubElement(programme_el, "date").text = program_data["originalAirDate"].replace("-", "")
 
+        if program_data.get("rating"):
+            # SD ratings are complex, taking the first simple one
+            ratings = program_data["rating"]
+            if isinstance(ratings, list) and len(ratings) > 0:
+                r = ratings[0]
+                rating_el = ET.SubElement(programme_el, "rating", system="MPAA")
+                ET.SubElement(rating_el, "value").text = r.get("code", str(r))
+
+        if program_data.get("episodeNumber") and program_data.get("seasonNumber"):
+            ep_num = program_data["episodeNumber"]
+            sea_num = program_data["seasonNumber"]
+            ET.SubElement(programme_el, "episode-num", system="xmltv_ns").text = f"{sea_num-1}.{ep_num-1}.0"
+            ET.SubElement(programme_el, "episode-num", system="onscreen").text = f"S{sea_num:02d}E{ep_num:02d}"
+
+        # Flags
+        if airing.get("repeat") is True:
+            ET.SubElement(programme_el, "previously-shown")
+        if airing.get("premiere") is True:
+            ET.SubElement(programme_el, "premiere")
+
+        video_props = airing.get("videoProperties", [])
+        if "hdtv" in video_props or "uhdtv" in video_props:
+            quality_el = ET.SubElement(programme_el, "video")
+            ET.SubElement(quality_el, "quality").text = "HDTV" if "hdtv" in video_props else "UHDTV"
+
+        programme_count += 1
+
+    logger.info(f"Built {programme_count} <programme> entries ({skipped_count} skipped: program data missing or invalid)")
+    return tv_el
+
+# --- Main Execution ---
 def main() -> int:
     username = _env("SD_USERNAME", required=True)
     password = _env("SD_PASSWORD", required=True)
@@ -191,7 +301,7 @@ def main() -> int:
         lineup_payload = client.get_lineup(lineup_id, verbose=True)
         stations = client.stations_from_lineup(lineup_payload)
         if not stations:
-            raise SystemExit(f"Lineup {lineup_id} returned zero stations; refusing to write an empty guide.")
+            raise SystemExit(f"Lineup {lineup_id} returned zero stations")
         logger.info("Lineup has %d stations", len(stations))
 
         station_ids = [s.station_id for s in stations]
@@ -199,9 +309,9 @@ def main() -> int:
         logger.info("Fetching schedules for %d stations x %d days", len(station_ids), len(dates))
         schedules = client.get_schedules(station_ids, dates)
 
-        program_ids = sorted({airing["programID"] for entry in schedules for airing in entry.get("programs", [])})
+        program_ids = sorted({airing["programID"] for entry in schedules for airing in entry.get("programs", []) if "programID" in airing})
         logger.info("Fetching metadata for %d distinct programs", len(program_ids))
-        programs = client.get_programs(program_ids)
+        programs = client.get_programs(set(program_ids))
 
     except SDError as exc:
         logger.error("Schedules Direct request failed: %s", exc)
@@ -209,25 +319,44 @@ def main() -> int:
 
     tv_element = build_xmltv(stations, schedules, programs)
 
+    # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Pretty print the XML
     ET.indent(tv_element, space="  ")
     tree = ET.ElementTree(tv_element)
 
+    # --- ATOMIC WRITE STRATEGY ---
+    # 1. Define temp path
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    tree.write(tmp_path, encoding="UTF-8", xml_declaration=True)
-
-    # Insert the XMLTV DOCTYPE, which ElementTree has no native support for.
-    with open(tmp_path, "r", encoding="utf-8") as fh:
-        contents = fh.read()
-    declaration, _, rest = contents.partition("\n")
-    contents = f'{declaration}\n<!DOCTYPE tv SYSTEM "xmltv.dtd">\n{rest}'
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(contents)
-    tmp_path.replace(output_path)
-
-    logger.info("Wrote %s (%d bytes)", output_path, output_path.stat().st_size)
-    return 0
-
+    
+    try:
+        # 2. Write to temp file
+        tree.write(tmp_path, encoding="UTF-8", xml_declaration=True)
+        
+        # 3. Inject DOCTYPE (ElementTree doesn't support this natively)
+        with open(tmp_path, "r", encoding="utf-8") as fh:
+            contents = fh.read()
+        
+        declaration, _, rest = contents.partition("\n")
+        # Insert DOCTYPE after XML declaration
+        contents = f'{declaration}\n<!DOCTYPE tv SYSTEM "xmltv.dtd">\n{rest}'
+        
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(contents)
+        
+        # 4. Atomic rename
+        tmp_path.replace(output_path)
+        
+        logger.info("Wrote %s (%d bytes)", output_path, output_path.stat().st_size)
+        return 0
+        
+    except Exception as e:
+        logger.error("Failed to write output file: %s", e)
+        # Cleanup temp file if it exists
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())
