@@ -68,17 +68,17 @@ class SDClient:
         logger.info("Authenticating with Schedules Direct...")
         payload = {
             "username": self.username,
-            "password": hashlib.sha256(self.password.encode()).hexdigest()
+            "password": hashlib.sha1(self.password.encode()).hexdigest()
         }
         try:
             resp = self.session.post(f"{SD_API_BASE}/token", json=payload)
             resp.raise_for_status()
             data = resp.json()
-            if data.get("errorCode") == "OK":
+            if data.get("code") == 0:
                 self.token = data["token"]
                 # Token expires in 24 hours, but we'll refresh 1 hour early
                 self.token_expires = datetime.now() + timedelta(hours=23)
-                self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+                self.session.headers.update({"token": self.token})
                 logger.info("Authentication successful.")
             else:
                 raise SDError(f"Auth failed: {data.get('message', 'Unknown error')}")
@@ -91,7 +91,11 @@ class SDClient:
         try:
             resp = self.session.get(f"{SD_API_BASE}/lineups/{lineup_id}")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            errors = [x for x in data if isinstance(x, dict) and x.get("code")]
+            if errors:
+                raise SDError(f"{len(errors)} station(s) returned errors: {errors[:3]}")
+            return data
         except requests.RequestException as e:
             raise SDError(f"Failed to fetch lineup: {e}")
 
@@ -110,11 +114,7 @@ class SDClient:
         if not station_ids or not dates:
             return []
 
-        payload = {
-            "stations": station_ids,
-            "startTime": dates[0],
-            "endTime": dates[-1]
-        }
+        payload = [{"stationID": station_id, "date": dates} for station_id in station_ids]
         try:
             # Schedules Direct limits requests to 1 hour of data per call usually, 
             # but the /schedules/endpoint allows a range. We'll use the program endpoint later.
@@ -126,7 +126,7 @@ class SDClient:
             # We will request day by day to stay safe within limits if needed, 
             # but the endpoint supports a range.
             
-            resp = self.session.post(f"{SD_API_BASE}/schedules/endpoint", json=payload)
+            resp = self.session.post(f"{SD_API_BASE}/schedules", json=payload)
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
@@ -197,7 +197,7 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
     for airing in all_airings:
         program_id = airing.get("programID")
         station_id = airing.get("stationID")
-        start_time = airing.get("time")
+        start_time = airing.get("airDateTime")
         duration = airing.get("duration", 0)
 
         if not program_id or not start_time or not station_id:
@@ -217,7 +217,7 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
             # Simple offset approximation, ideally parse the timezone properly
             start_str += "+0000" 
             
-            dt_end = dt_start + timedelta(minutes=duration)
+            dt_end = dt_start + timedelta(seconds=duration)
             stop_str = dt_end.strftime("%Y%m%d%H%M%S +0000")
         except ValueError:
             skipped_count += 1
@@ -304,7 +304,7 @@ def main() -> int:
             raise SystemExit(f"Lineup {lineup_id} returned zero stations")
         logger.info("Lineup has %d stations", len(stations))
 
-        station_ids = [s.station_id for s in stations]
+        station_ids = [s["station_id"] for s in stations]
         dates = _daterange(days_ahead)
         logger.info("Fetching schedules for %d stations x %d days", len(station_ids), len(dates))
         schedules = client.get_schedules(station_ids, dates)
