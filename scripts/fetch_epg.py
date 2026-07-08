@@ -166,22 +166,14 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
     tv_el.set("generator-info-name", "ServiceElectricEPG")
     tv_el.set("generator-info-url", "https://github.com/bilbywilby/service-electric-epg")
 
-    # Build Channel list
     station_map = {s["station_id"]: s for s in stations}
     for station in stations:
         channel_el = ET.SubElement(tv_el, "channel", id=station["station_id"])
-        ET.SubElement(channel_el, "display-name").text = f"{station.get('channel', '')} {station['station_id']}"
-        ET.SubElement(channel_el, "display-name").text = station["station_id"]
+        ET.SubElement(channel_el, "display-name").text = f"{station.get('channel', '')} {station['station_id']}".strip()
 
-    # Build Programme list
     programme_count = 0
     skipped_count = 0
 
-    # Schedules Direct returns a list of lists (one list per station requested)
-    # Or a single list depending on endpoint usage. We assume flat list of entries for simplicity 
-    # or handle the nested structure if the API returns it.
-    # The /schedules/endpoint returns a list of objects containing 'stationID' and 'programs'
-    
     all_airings = []
     if isinstance(schedules, list):
         for entry in schedules:
@@ -191,7 +183,6 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
                     prog_entry["stationID"] = station_id
                     all_airings.append(prog_entry)
             elif isinstance(entry, dict) and "programID" in entry:
-                # Fallback if API returns flat list
                 all_airings.append(entry)
 
     for airing in all_airings:
@@ -209,14 +200,9 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
             skipped_count += 1
             continue
 
-        # Format start time (YYYYMMDDHHMMSS +offset)
-        # SD returns '2023-10-01T12:00:00Z' or similar
         try:
             dt_start = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-            start_str = dt_start.strftime("%Y%m%d%H%M%S ")
-            # Simple offset approximation, ideally parse the timezone properly
-            start_str += "+0000" 
-            
+            start_str = dt_start.strftime("%Y%m%d%H%M%S +0000")
             dt_end = dt_start + timedelta(seconds=duration)
             stop_str = dt_end.strftime("%Y%m%d%H%M%S +0000")
         except ValueError:
@@ -224,54 +210,65 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
             continue
 
         programme_el = ET.SubElement(tv_el, "programme", start=start_str, stop=stop_str, channel=station_id)
-        
-        title = program_data.get("title", "Unknown Title")
-        ET.SubElement(programme_el, "title", lang="en").text = title
 
-        if program_data.get("subtitle"):
-            ET.SubElement(programme_el, "sub-title", lang="en").text = program_data["subtitle"]
-        
-        if program_data.get("description"):
-            ET.SubElement(programme_el, "desc", lang="en").text = program_data["description"]
+        titles = program_data.get("titles", [])
+        title_text = "Unknown Title"
+        if titles and isinstance(titles, list):
+            title_text = titles[0].get("title120", titles[0].get("title70", "Unknown Title"))
+        ET.SubElement(programme_el, "title", lang="en").text = title_text
 
-        if program_data.get("primaryCategory"):
-            cat = program_data["primaryCategory"]
-            ET.SubElement(programme_el, "category", lang="en").text = cat
-        
-        # Handle genres (list)
+        episode_title = program_data.get("episodeTitle150")
+        if episode_title:
+            ET.SubElement(programme_el, "sub-title", lang="en").text = episode_title
+
+        descriptions = program_data.get("descriptions", {})
+        desc_text = None
+        for desc_len in ["description100", "description1000", "description10000"]:
+            if desc_len in descriptions and isinstance(descriptions[desc_len], list):
+                desc_text = descriptions[desc_len][0].get("description")
+                break
+        if desc_text:
+            ET.SubElement(programme_el, "desc", lang="en").text = desc_text
+
         for genre in program_data.get("genres", []):
             ET.SubElement(programme_el, "category", lang="en").text = genre
 
-        if program_data.get("showType"):
-            # Map SD showType to XMLTV type
-            st = program_data["showType"].lower()
-            if "movie" in st:
-                programme_el.set("category", "movie")
-            elif "series" in st:
-                programme_el.set("category", "series")
+        show_type = program_data.get("eventDetails", {}).get("subType", "").lower()
+        if not show_type and program_data.get("showType"):
+            show_type = program_data.get("showType").lower()
             
+        if "movie" in show_type or show_type == "feature film":
+            programme_el.set("category", "movie")
+        elif "series" in show_type:
+            programme_el.set("category", "series")
+
         if program_data.get("originalAirDate"):
             ET.SubElement(programme_el, "date").text = program_data["originalAirDate"].replace("-", "")
 
-        if program_data.get("rating"):
-            # SD ratings are complex, taking the first simple one
-            ratings = program_data["rating"]
-            if isinstance(ratings, list) and len(ratings) > 0:
-                r = ratings[0]
-                rating_el = ET.SubElement(programme_el, "rating", system="MPAA")
-                ET.SubElement(rating_el, "value").text = r.get("code", str(r))
+        for rating in program_data.get("contentRating", []):
+            if rating.get("code"):
+                rating_el = ET.SubElement(programme_el, "rating", system=rating.get("body", "MPAA"))
+                ET.SubElement(rating_el, "value").text = rating["code"]
 
-        if program_data.get("episodeNumber") and program_data.get("seasonNumber"):
-            ep_num = program_data["episodeNumber"]
-            sea_num = program_data["seasonNumber"]
-            ET.SubElement(programme_el, "episode-num", system="xmltv_ns").text = f"{sea_num-1}.{ep_num-1}.0"
-            ET.SubElement(programme_el, "episode-num", system="onscreen").text = f"S{sea_num:02d}E{ep_num:02d}"
+        season_num = None
+        episode_num = None
+        for meta in program_data.get("metadata", []):
+            if "Gracenote" in meta:
+                season_num = meta["Gracenote"].get("season")
+                episode_num = meta["Gracenote"].get("episode")
+                break
+        
+        if season_num and episode_num:
+            try:
+                ET.SubElement(programme_el, "episode-num", system="xmltv_ns").text = f"{int(season_num)-1}.{int(episode_num)-1}.0"
+                ET.SubElement(programme_el, "episode-num", system="onscreen").text = f"S{int(season_num):02d}E{int(episode_num):02d}"
+            except ValueError:
+                pass
 
-        # Flags
-        if airing.get("repeat") is True:
-            ET.SubElement(programme_el, "previously-shown")
-        if airing.get("premiere") is True:
+        if airing.get("new") is True or airing.get("premiere") is True:
             ET.SubElement(programme_el, "premiere")
+        elif airing.get("repeat") is True:
+            ET.SubElement(programme_el, "previously-shown")
 
         video_props = airing.get("videoProperties", [])
         if "hdtv" in video_props or "uhdtv" in video_props:
@@ -280,7 +277,7 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
 
         programme_count += 1
 
-    logger.info(f"Built {programme_count} <programme> entries ({skipped_count} skipped: program data missing or invalid)")
+    logger.info(f"Built {programme_count} <programme> entries ({skipped_count} skipped)")
     return tv_el
 
 # --- Main Execution ---
