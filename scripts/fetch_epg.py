@@ -166,10 +166,16 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
     tv_el.set("generator-info-name", "ServiceElectricEPG")
     tv_el.set("generator-info-url", "https://github.com/bilbywilby/service-electric-epg")
 
-    station_map = {s["station_id"]: s for s in stations}
+    station_map = {}
+    for s in stations:
+        s_id = s["station_id"] if isinstance(s, dict) else getattr(s, "station_id", "")
+        station_map[s_id] = s
+
     for station in stations:
-        channel_el = ET.SubElement(tv_el, "channel", id=station["station_id"])
-        ET.SubElement(channel_el, "display-name").text = f"{station.get('channel', '')} {station['station_id']}".strip()
+        s_id = station["station_id"] if isinstance(station, dict) else getattr(station, "station_id", "")
+        s_chan = station.get("channel", "") if isinstance(station, dict) else getattr(station, "channel", "")
+        channel_el = ET.SubElement(tv_el, "channel", id=s_id)
+        ET.SubElement(channel_el, "display-name").text = f"{s_chan} {s_id}".strip()
 
     programme_count = 0
     skipped_count = 0
@@ -260,7 +266,7 @@ def build_xmltv(stations: List[Dict], schedules: List[Dict], programs: Dict[str,
         
         if season_num and episode_num:
             try:
-                ET.SubElement(programme_el, "episode-num", system="xmltv_ns").text = f"{int(season_num)-1}.{int(episode_num)-1}.0"
+                ET.SubElement(programme_el, "episode-num", system="xmltv_ns").text = f"{int(season_num)-1}.{int(episode_num)-1}."
                 ET.SubElement(programme_el, "episode-num", system="onscreen").text = f"S{int(season_num):02d}E{int(episode_num):02d}"
             except ValueError:
                 pass
