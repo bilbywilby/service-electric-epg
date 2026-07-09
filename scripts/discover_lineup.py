@@ -26,7 +26,10 @@ import getpass
 import os
 import sys
 
-from sdclient import SDClient, SDError
+try:
+    from .sdclient import SDClient, SDError
+except ImportError:
+    from sdclient import SDClient, SDError
 
 USER_AGENT = "service-electric-epg-discovery/1.0 (+https://github.com/)"
 

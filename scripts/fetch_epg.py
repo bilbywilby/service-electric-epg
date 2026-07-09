@@ -17,11 +17,14 @@ from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
 try:
-    from sdclient import SDClient, SDError, Station
+    from .sdclient import SDClient, SDError, Station
 except ImportError:
-    print("Error: could not import sdclient.py. Run this from the scripts/ directory, "
-          "or ensure scripts/ is on PYTHONPATH. ('pip install requests' if that's the underlying error.)")
-    sys.exit(1)
+    try:
+        from sdclient import SDClient, SDError, Station
+    except ImportError:
+        print("Error: could not import sdclient.py. Run this from the scripts/ directory, "
+              "or ensure scripts/ is on PYTHONPATH. ('pip install requests' if that's the underlying error.)")
+        sys.exit(1)
 
 DEFAULT_USER_AGENT = "ServiceElectricEPG/1.0 (Automated EPG Generator)"
 
