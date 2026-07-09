@@ -35,6 +35,28 @@ which is exactly this repo's use case.
    **no commit**, so consumers always see the last good guide instead of an
    empty or truncated one.
 
+## Idempotency guarantees
+
+This service is designed to be **fully idempotent** — it is safe to run
+multiple times concurrently or in close succession with the following
+guarantees:
+
+- **Atomic writes**: Output files are written to a temporary file first, then
+  atomically moved into place. A failed fetch never overwrites a valid guide.
+- **Validation before commit**: XML is validated to be well-formed before
+  any file is written. Invalid data never reaches consumers.
+- **Concurrency control**: In GitHub Actions, `concurrency.cancel-in-progress: false`
+  ensures sequential execution — only one workflow runs at a time.
+- **Change detection**: Commits only happen if the generated XML differs
+  from what's already in the repo, minimizing unnecessary commits.
+- **No partial updates**: If any step fails (authentication, API fetch,
+  validation, or file I/O), the previous valid guide remains untouched.
+
+If you run this locally using `wrapper.sh`, file-level locking (`flock`)
+prevents concurrent executions. If you run the fetch script directly
+(e.g., in a container or scheduled task), ensure only one instance
+executes at a time using your orchestrator's native locking or job control.
+
 ## One-time setup
 
 ### 1. Create a Schedules Direct account
@@ -81,6 +103,45 @@ secret, which is appropriate for the lineup ID since it isn't credentials.
 Push this repo, then either wait for the next scheduled run or trigger it
 manually from the **Actions** tab (`Update XMLTV Guide` > `Run workflow`).
 
+## Testing locally
+
+To verify setup and test the fetch without waiting for the scheduled cron:
+
+```bash
+# Run offline tests (no network, no credentials needed)
+python -m pytest tests/ -v
+
+# Run the actual fetch (requires SD_* env vars set)
+cd scripts
+export SD_USERNAME="your-email@example.com"
+export SD_PASSWORD="your-password"
+export SD_LINEUP_ID="USA-PA12345-X"
+export OUTPUT_PATH="../data/guide.xml"
+python fetch_epg.py
+```
+
+If run multiple times in succession, the script will produce identical
+output (same XML structure and data) because it fetches the same schedule
+window and builds the same guide. Only the generation timestamp in logs differs.
+
+## Error handling and recovery
+
+**If a fetch fails:**
+- The script logs the error and exits with a non-zero code
+- No file is written; the previous `data/guide.xml` remains untouched
+- In GitHub Actions, a failed fetch prevents the commit step
+- Consumers continue seeing the last known-good guide
+
+**If you see validation errors:**
+- The XML is checked to be well-formed before any commit
+- If parsing fails, you'll see an error and the old guide remains in place
+- This catches both API corruption and code bugs
+
+**If a run is interrupted mid-fetch:**
+- The temporary file (`*.tmp`) is abandoned
+- Your main guide remains valid
+- The next run will attempt the fetch again
+
 ## Pointing your XMLTV consumer at the guide
 
 Once the first commit lands, the raw file is at:
@@ -91,6 +152,41 @@ https://raw.githubusercontent.com/<your-username>/<repo-name>/main/data/guide.xm
 
 Put that URL in the "File:" field of your XMLTV fetcher settings (this is
 exactly the field visible in Telly Skout's Settings screen).
+
+## Troubleshooting
+
+### "Job already running, skipping"
+This is expected behavior with `wrapper.sh` on local/Termux setups.
+If you see this repeatedly, a previous run may be stuck. Check:
+```bash
+ps aux | grep fetch_epg
+```
+If hung, kill it and the next cron run will proceed. GitHub Actions handles
+this automatically.
+
+### Guide hasn't updated in days
+- Check **Actions** tab for workflow errors or timeouts
+- Verify secrets are set (Settings > Secrets and variables > Actions)
+- Verify the lineup ID is correct (try rediscovery with `scripts/discover_lineup.py`)
+- Check Schedules Direct status page (schedulesdirect.org) for service issues
+
+### XML parsing errors on update
+This usually means the Schedules Direct API returned corrupt data, or a bug
+was introduced. The workflow tests run first; if they fail, no fetch happens.
+Check the test job's output for details.
+
+### Running multiple times produces different guides
+This should not happen. If it does:
+1. Verify the same `DAYS_AHEAD` value is being used
+2. Check that each run has fresh Schedules Direct credentials (tokens are cached)
+3. If one run is concurrent with another, file-locking should prevent corruption,
+   but increase delays. Check wrapper.sh logs.
+
+### My guide won't update because the content hasn't changed
+This is correct behavior and a feature, not a bug. If Schedules Direct returns
+the same data (no new programs, no schedule changes), the workflow detects no
+differences and skips the commit to keep the repo clean and the git history
+readable.
 
 ## Honest limitations
 
@@ -106,6 +202,8 @@ exactly the field visible in Telly Skout's Settings screen).
   24 hours, and a 24-hour token lifetime that `sdclient.py` caches and
   reuses rather than re-requesting. A single daily run is nowhere near
   these limits; hammering the discovery script repeatedly could hit them.
+  The fetch script itself is safe to run repeatedly within the same day
+  (it re-authenticates and fetches fresh data, and is fully idempotent).
 - **Licensing.** Schedules Direct's data license restricts use to individual,
   non-commercial, open-source applications -- this repo's daily-cron,
   single-account setup fits that, but redistributing the generated

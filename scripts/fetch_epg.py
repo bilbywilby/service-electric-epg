@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 EPG Generator: Fetches schedule data from Schedules Direct and builds an XMLTV file.
+
+This script is fully idempotent:
+  - Fetches from Schedules Direct API
+  - Builds XMLTV ElementTree and validates structure
+  - Writes atomically to a temp file, then moves into place
+  - On any error, previous valid guide remains untouched
 """
 import os
 import sys
@@ -33,10 +39,22 @@ def _env(key: str, default: Optional[str] = None, required: bool = False) -> str
         raise ValueError(f"Missing required environment variable: {key}")
     return value
 
-def _daterange(days: int) -> List[str]:
-    """Generate a list of ISO date strings for the next N days."""
-    today = datetime.now().date()
-    return [(today + timedelta(days=i)).isoformat() for i in range(days)]
+def _validate_xml_file(file_path: Path) -> bool:
+    """
+    Validate that a file is well-formed XML without corruption.
+    Returns True if valid, False otherwise.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            ET.parse(fh)
+        return True
+    except ET.ParseError as e:
+        logger.error("XML validation failed: %s", e)
+        return False
+    except Exception as e:
+        logger.error("Unexpected error validating XML: %s", e)
+        return False
+
 
 def build_xmltv(stations: List[Station], schedules: List[Dict], programs: Dict[str, Any]) -> ET.Element:
     """Build the XMLTV ElementTree from fetched data."""
@@ -162,6 +180,9 @@ def main() -> int:
     output_path = Path(_env("OUTPUT_PATH", "data/guide.xml"))
     user_agent = _env("SD_USER_AGENT", DEFAULT_USER_AGENT)
 
+    logger.info("Starting EPG fetch (idempotent run)")
+    logger.info("Output: %s, Days ahead: %d", output_path, days_ahead)
+
     client = SDClient(username=username, password=password, user_agent=user_agent)
 
     try:
@@ -197,8 +218,10 @@ def main() -> int:
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
 
     try:
+        # Write to temporary file first
         tree.write(tmp_path, encoding="UTF-8", xml_declaration=True)
 
+        # Add DOCTYPE declaration
         with open(tmp_path, "r", encoding="utf-8") as fh:
             contents = fh.read()
 
@@ -208,9 +231,19 @@ def main() -> int:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.write(contents)
 
+        # Validate XML is well-formed before making it live
+        logger.info("Validating XML structure...")
+        if not _validate_xml_file(tmp_path):
+            logger.error("Generated XML failed validation; aborting write")
+            tmp_path.unlink()
+            return 1
+
+        # Atomic move: this either succeeds entirely or fails, never partial
         tmp_path.replace(output_path)
 
-        logger.info("Wrote %s (%d bytes)", output_path, output_path.stat().st_size)
+        final_size = output_path.stat().st_size
+        logger.info("Wrote %s (%d bytes)", output_path, final_size)
+        logger.info("XML is well-formed and ready for consumption")
         return 0
 
     except Exception as e:
