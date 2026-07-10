@@ -1,2 +1,6 @@
 -r requirements.txt
 pytest>=8.0,<9
+ruff>=0.15,<1
+black>=26.5,<27
+mypy>=2.2,<3
+types-requests>=2.32,<3

@@ -117,7 +117,15 @@ class SDClient:
         retry = Retry(
             total=4,
             backoff_factor=1.5,
-            status_forcelist=(500, 502, 503, 504),
+            # 429 added: urllib3 will already retry 429 automatically if SD
+            # sends a Retry-After header (413/429/503 are special-cased for
+            # that regardless of status_forcelist), but that's conditional
+            # on the header being present. Listing 429 here unconditionally
+            # retries it either way, while respect_retry_after_header
+            # (default True) still honors the header's specific wait time
+            # when SD does send one, instead of always falling back to the
+            # backoff_factor curve.
+            status_forcelist=(429, 500, 502, 503, 504),
             allowed_methods=("GET", "POST", "PUT", "DELETE"),
         )
         adapter = HTTPAdapter(max_retries=retry)
@@ -159,9 +167,10 @@ class SDClient:
         json_body: Any = None,
         params: dict[str, str] | None = None,
         require_token: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
         url = f"{self._base_url}{path}"
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(extra_headers or {})
         if require_token:
             if self._token is None:
                 raise SDAuthError(0, "authenticate() must be called before other requests")
@@ -258,17 +267,13 @@ class SDClient:
         return payload.get("lineups", [])
 
     def get_lineup(self, lineup_id: str, verbose: bool = True) -> dict[str, Any]:
-        headers_note = {"verboseMap": "true"} if verbose else {}
-        # verboseMap must ride in the request headers per the API docs;
-        # _request only sets token/content headers, so add it manually here.
-        url = f"{self._base_url}/lineups/{lineup_id}"
-        headers = {"token": self._token or "", **headers_note}
-        if self._token is None:
-            raise SDAuthError(0, "authenticate() must be called before get_lineup()")
-        response = self._session.get(url, headers=headers, timeout=self._timeout)
-        payload = response.json()
-        self._raise_for_sd_error(payload)
-        return payload
+        # verboseMap must ride in the request headers per the API docs.
+        # Routed through the shared _request() so this gets the same
+        # JSON-decode-error handling and error normalization as every
+        # other call, instead of a hand-rolled session.get() that skipped
+        # both.
+        extra_headers = {"verboseMap": "true"} if verbose else None
+        return self._request("GET", f"/lineups/{lineup_id}", extra_headers=extra_headers)
 
     def stations_from_lineup(self, lineup_payload: dict[str, Any]) -> list[Station]:
         stations_by_id = {s["stationID"]: s for s in lineup_payload.get("stations", [])}
@@ -308,13 +313,37 @@ class SDClient:
             yield items[i : i + size]
 
     def get_schedules(self, station_ids: list[str], dates: list[str]) -> list[dict[str, Any]]:
-        """Fetch schedules for every (station, date) combination requested."""
+        """Fetch schedules for every (station, date) combination requested.
+
+        A single chunk of up to MAX_STATIONIDS_PER_SCHEDULE_REQUEST stations
+        failing outright (retries exhausted, or an SD hard-failure code) does
+        not abort the whole run -- it's logged and the remaining chunks are
+        still attempted, so one bad batch of stations degrades the guide
+        instead of blanking it entirely.
+        """
         all_entries: list[dict[str, Any]] = []
-        for station_chunk in self._chunk(station_ids, MAX_STATIONIDS_PER_SCHEDULE_REQUEST):
+        chunks = list(self._chunk(station_ids, MAX_STATIONIDS_PER_SCHEDULE_REQUEST))
+        for chunk_num, station_chunk in enumerate(chunks, start=1):
             body = [{"stationID": sid, "date": dates} for sid in station_chunk]
-            payload = self._request_with_queue_retry("POST", "/schedules", json_body=body)
+            try:
+                payload = self._request_with_queue_retry("POST", "/schedules", json_body=body)
+            except SDError as exc:
+                logger.warning(
+                    "Schedule chunk %d/%d (%d stations) failed entirely and was skipped: %s",
+                    chunk_num,
+                    len(chunks),
+                    len(station_chunk),
+                    exc,
+                )
+                continue
             if not isinstance(payload, list):
-                raise SDError(0, f"unexpected /schedules response shape: {type(payload)!r}")
+                logger.warning(
+                    "Schedule chunk %d/%d returned unexpected shape %r; skipped",
+                    chunk_num,
+                    len(chunks),
+                    type(payload),
+                )
+                continue
             for entry in payload:
                 if isinstance(entry, dict) and entry.get("code") not in (None, 0):
                     logger.warning(
@@ -328,13 +357,34 @@ class SDClient:
         return all_entries
 
     def get_programs(self, program_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Fetch program metadata, keyed by programID. Skips IDs SD can't produce."""
+        """Fetch program metadata, keyed by programID. Skips IDs SD can't
+        produce, and skips an entire failed chunk with a warning rather than
+        aborting the whole run -- missing metadata for a subset of programs
+        just means those airings get dropped later in build_xmltv, not that
+        the guide fails to build at all."""
         unique_ids = sorted(set(program_ids))
         programs: dict[str, dict[str, Any]] = {}
-        for chunk in self._chunk(unique_ids, MAX_PROGRAMIDS_PER_REQUEST):
-            payload = self._request_with_queue_retry("POST", "/programs", json_body=chunk)
+        chunks = list(self._chunk(unique_ids, MAX_PROGRAMIDS_PER_REQUEST))
+        for chunk_num, chunk in enumerate(chunks, start=1):
+            try:
+                payload = self._request_with_queue_retry("POST", "/programs", json_body=chunk)
+            except SDError as exc:
+                logger.warning(
+                    "Program metadata chunk %d/%d (%d programs) failed entirely and was skipped: %s",
+                    chunk_num,
+                    len(chunks),
+                    len(chunk),
+                    exc,
+                )
+                continue
             if not isinstance(payload, list):
-                raise SDError(0, f"unexpected /programs response shape: {type(payload)!r}")
+                logger.warning(
+                    "Program chunk %d/%d returned unexpected shape %r; skipped",
+                    chunk_num,
+                    len(chunks),
+                    type(payload),
+                )
+                continue
             for entry in payload:
                 if not isinstance(entry, dict):
                     continue

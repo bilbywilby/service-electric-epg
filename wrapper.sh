@@ -41,12 +41,21 @@ log() {
 }
 
 # Cleanup on exit
+LOCK_ACQUIRED=0
+
 cleanup() {
     local exit_code=$?
     if [[ -n "$LOCK_FD" ]]; then
         exec {LOCK_FD}>&-  # Close the file descriptor
     fi
-    rm -f "$LOCK_FILE"
+    # Only remove the lock file if THIS instance actually held the lock.
+    # The "another instance is already running" path below also exits
+    # through this trap; unconditionally rm'ing here would delete the
+    # real lock out from under the instance that's actually running,
+    # letting a third overlapping invocation start concurrently with it.
+    if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
+        rm -f "$LOCK_FILE"
+    fi
     if [[ $exit_code -ne 0 ]]; then
         log "ERROR" "Script exited with code $exit_code"
     fi
@@ -65,6 +74,7 @@ flock -n "$LOCK_FD" || {
     log "INFO" "Another instance is already running; exiting gracefully"
     exit 0
 }
+LOCK_ACQUIRED=1
 
 # Store PID for debugging
 echo $$ > "$PID_FILE" 2>/dev/null || true
